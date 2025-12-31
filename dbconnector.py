@@ -1,102 +1,213 @@
+#!/usr/bin/env python3
+
 import sys
+import signal
+import argparse
 import mysql.connector
+from mysql.connector import Error as MySQLError
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
+import unicodedata
 
-BATCH_SIZE = 5000  # Adjust this to optimize performance based on your DB performance
+# ==============================
+# PIPELINE SAFETY
+# ==============================
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
+# ==============================
+# CONFIG
+# ==============================
+BATCH_SIZE = 5000
+FETCH_CHUNK = 10000
+
+DB_HOST = ""
+DB_USER = ""
+DB_PASSWORD = ""
+DB_NAME = ""
+DB_PORT = 3306
+
+
+def eprint(*args, **kwargs):
+    """Always log to stderr (safe for pipelines)."""
+    print(*args, file=sys.stderr, **kwargs)
+
+
+# ==============================
+# DATABASE
+# ==============================
 def connect_to_db():
     return mysql.connector.connect(
-        host="",
-        user="",
-        password="",
-        database=""
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        port=DB_PORT,
+        autocommit=False,
     )
 
-def bulk_insert(cursor, table_name, batch):
-    cursor.executemany(f"INSERT IGNORE INTO `{table_name}` (url) VALUES (%s)", batch)
 
-def process_urls(table_name, urls, batch_size=BATCH_SIZE):
+def truncate_table(table_name):
     conn = connect_to_db()
     cursor = conn.cursor()
-    total_urls = len(urls)
+    try:
+        cursor.execute(f"TRUNCATE TABLE `{table_name}`")
+        conn.commit()
+        eprint(f"[OK] Truncated table {table_name}")
+    finally:
+        cursor.close()
+        conn.close()
 
-    batches = [urls[i:i + batch_size] for i in range(0, total_urls, batch_size)]
 
-    with tqdm(total=total_urls, desc=f"Inserting into {table_name}", unit="url") as pbar:
-        for batch in batches:
-            bulk_insert(cursor, table_name, batch)
-            conn.commit()  # Commit after each batch insert
+# ==============================
+# STREAMING INSERT (APPEND / BULK)
+# ==============================
+def stream_insert(table_name, batch_size=BATCH_SIZE, show_progress=True):
+    conn = connect_to_db()
+    cursor = conn.cursor()
+
+    insert_sql = f"INSERT IGNORE INTO `{table_name}` (url) VALUES (%s)"
+
+    batch = []
+    read_count = 0
+    inserted_est = 0
+
+    pbar = tqdm(
+        desc=f"Inserting into {table_name}",
+        unit="url",
+        disable=not show_progress or not sys.stderr.isatty(),
+    )
+
+    try:
+        # Read stdin as bytes and decode safely
+        for raw_line in sys.stdin.buffer:
+            url = raw_line.decode('utf-8', errors='ignore').strip()
+            if not url:
+                continue
+            # Optional: normalize Unicode
+            url = unicodedata.normalize('NFC', url)
+
+            read_count += 1
+            batch.append((url,))
+
+            if len(batch) >= batch_size:
+                cursor.executemany(insert_sql, batch)
+                conn.commit()
+                inserted_est += max(cursor.rowcount, 0)
+                pbar.update(len(batch))
+                batch.clear()
+
+        if batch:
+            cursor.executemany(insert_sql, batch)
+            conn.commit()
+            inserted_est += max(cursor.rowcount, 0)
             pbar.update(len(batch))
 
-    cursor.close()
-    conn.close()
+    except BrokenPipeError:
+        sys.exit(0)
 
-def bulk_file(table_name, urls):
-    # Delete all entries first
-    delete_all(table_name)
-    process_urls(table_name, urls)
+    finally:
+        try:
+            pbar.close()
+        except Exception:
+            pass
+        cursor.close()
+        conn.close()
 
-def append_file(table_name, urls):
-    process_urls(table_name, urls)
+    return read_count, inserted_est
 
-def get_urls(table_name):
+
+# ==============================
+# FETCH URLs (DB → STDOUT)
+# ==============================
+def get_urls(table_name, chunk_size=FETCH_CHUNK):
     conn = connect_to_db()
     cursor = conn.cursor()
 
-    cursor.execute(f"SELECT url FROM `{table_name}`")
-    results = cursor.fetchall()
+    try:
+        cursor.execute(f"SELECT url FROM `{table_name}`")
+        fetched = 0
+        eprint(f"[INFO] Fetching URLs from {table_name}")
 
-    cursor.close()
-    conn.close()
+        while True:
+            rows = cursor.fetchmany(chunk_size)
+            if not rows:
+                break
 
-    for url in results:
-        print(url[0])
+            for (url,) in rows:
+                print(url)
 
-def delete_all(table_name):
-    conn = connect_to_db()
-    cursor = conn.cursor()
-    cursor.execute(f"TRUNCATE TABLE `{table_name}`")
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print(f"Deleted all entries in table {table_name}.")
+            fetched += len(rows)
+            eprint(f"[INFO] Fetched {fetched} rows")
 
+        eprint(f"[OK] Finished fetching {fetched} rows")
+
+    except BrokenPipeError:
+        sys.exit(0)
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ==============================
+# MAIN
+# ==============================
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='Update, retrieve, or delete URLs from the database.')
-    parser.add_argument('--table', required=True, help='Table name to operate on (e.g., all_urls)')
-    parser.add_argument('--bulk', action='store_true', help='Bulk file into the specified table')
-    parser.add_argument('--append', action='store_true', help='Append file into the specified table without deleting existing content')
-    parser.add_argument('--get', action='store_true', help='Retrieve URLs from the specified table')
-    parser.add_argument('--delete', action='store_true', help='Delete all entries in the specified table')
+    parser = argparse.ArgumentParser(
+        description="Stream URLs into MySQL with batching and pipeline safety"
+    )
+
+    parser.add_argument("--table", required=True, help="Table name (e.g. all_urls)")
+    parser.add_argument("--append", action="store_true", help="Append URLs from stdin")
+    parser.add_argument("--bulk", action="store_true", help="Truncate then insert from stdin")
+    parser.add_argument("--get", action="store_true", help="Print URLs from table")
+    parser.add_argument("--delete", action="store_true", help="Truncate table only")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--no-progress", action="store_true")
 
     args = parser.parse_args()
 
-    urls = []
-
-    # If --get is used, retrieve and print URLs from the specified table
-    if args.get:
-        get_urls(args.table)
-        return
+    if not (args.append or args.bulk or args.get or args.delete):
+        args.append = True
 
     try:
-        # Reading from the pipeline or standard input
-        for line in sys.stdin:
-            url = line.strip()
-            if url:
-                urls.append((url,))  # Tuple for executemany
-    except EOFError:
-        pass
+        if args.get:
+            get_urls(args.table)
+            return
 
-    if urls:
+        if args.delete:
+            truncate_table(args.table)
+            return
+
         if args.bulk:
-            bulk_file(args.table, urls)
-        elif args.append:
-            append_file(args.table, urls)
+            truncate_table(args.table)
 
-    if args.delete:
-        delete_all(args.table)
+        read_count, inserted_est = stream_insert(
+            args.table,
+            batch_size=args.batch_size,
+            show_progress=not args.no_progress,
+        )
 
-if __name__ == '__main__':
+        eprint(
+            f"[SUMMARY] table={args.table} "
+            f"read={read_count} inserted_estimate={inserted_est} "
+            f"batch_size={args.batch_size}"
+        )
+
+    except MySQLError as e:
+        eprint(f"[DB_ERROR] {e}")
+        sys.exit(3)
+
+    except KeyboardInterrupt:
+        eprint("[WARN] Interrupted by user")
+        sys.exit(130)
+
+    except BrokenPipeError:
+        sys.exit(0)
+
+    except Exception as e:
+        eprint(f"[UNEXPECTED] {type(e).__name__}: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
     main()
